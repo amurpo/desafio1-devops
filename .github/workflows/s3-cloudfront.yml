@@ -1,0 +1,89 @@
+name: Despliegue a S3 y CloudFront
+
+on:
+    push:
+      branches:
+        - main
+    pull_request:
+      branches:
+        - main
+      paths-ignore:
+        - 'LICENSE'
+        - 'README.md'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Get CloudFront Distribution Details
+      id: cloudfront-details
+      run: |
+        # Obtener el ID de distribución de CloudFront asociado al bucket
+        DISTRIBUTION_ID=$(aws cloudfront list-distributions \
+          --query "DistributionList.Items[?Origins.Items[0].DomainName=='${{ secrets.S3_BUCKET_NAME }}.s3.amazonaws.com'].Id" \
+          --output text)
+        
+        if [ -z "$DISTRIBUTION_ID" ]; then
+          echo "No se encontró distribución de CloudFront para el bucket"
+          exit 1
+        fi
+        
+        # Obtener la URL de CloudFront
+        CLOUDFRONT_URL=$(aws cloudfront get-distribution \
+          --id $DISTRIBUTION_ID \
+          --query 'Distribution.DomainName' \
+          --output text)
+        
+        echo "distribution-id=$DISTRIBUTION_ID" >> $GITHUB_OUTPUT
+        echo "cloudfront-url=$CLOUDFRONT_URL" >> $GITHUB_OUTPUT
+    
+    - name: Validate HTML files
+      run: |
+        for file in index.html error.html; do
+          if [ ! -f "$file" ]; then
+            echo "Error: $file no encontrado"
+            exit 1
+          fi
+          
+          if ! grep -q "<!DOCTYPE html>" "$file"; then
+            echo "Error: $file no parece ser un HTML válido"
+            exit 1
+          fi
+        done
+    
+    - name: Sync files to S3 bucket
+      run: |
+        aws s3 sync . s3://${{ secrets.S3_BUCKET_NAME }} \
+          --exclude "*" \
+          --include "index.html" \
+          --include "error.html"
+    
+    - name: Invalidate CloudFront cache
+      run: |
+        aws cloudfront create-invalidation \
+          --distribution-id ${{ steps.cloudfront-details.outputs.distribution-id }} \
+          --paths "/*"
+    
+    - name: Verify Deployment
+      run: |
+        # Verificar que los archivos estén en S3
+        aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}
+        
+        # URL de CloudFront
+        CLOUDFRONT_URL=${{ steps.cloudfront-details.outputs.cloudfront-url }}
+        echo "CloudFront URL: https://$CLOUDFRONT_URL"
+        
+        # Intentar obtener los archivos
+        curl -f https://$CLOUDFRONT_URL/index.html
+        curl -f https://$CLOUDFRONT_URL/error.html
