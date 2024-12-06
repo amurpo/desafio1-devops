@@ -36,11 +36,42 @@ jobs:
             echo "Error: $file no encontrado"
             exit 1
           fi
+
           if ! grep -q "<!DOCTYPE html>" "$file"; then
             echo "Error: $file no parece ser un HTML válido"
             exit 1
           fi
         done
+
+    - name: Update S3 bucket policy for CloudFront
+      run: |
+        OAI_ID=$(aws cloudfront list-cloud-front-origin-access-identities --query "CloudFrontOriginAccessIdentityList.Items[0].Id" --output text)
+
+        if [ -z "$OAI_ID" ]; then
+          echo "Error: No se encontró una Origin Access Identity (OAI) para CloudFront"
+          exit 1
+        fi
+
+        BUCKET_POLICY=$(cat <<-EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity $OAI_ID"
+              },
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::${{ secrets.S3_BUCKET_NAME }}/*"
+            }
+          ]
+        }
+        EOF
+        )
+
+        echo "$BUCKET_POLICY" > bucket-policy.json
+        aws s3api put-bucket-policy --bucket ${{ secrets.S3_BUCKET_NAME }} --policy file://bucket-policy.json
+        rm bucket-policy.json
 
     - name: Sync files to S3 bucket
       run: |
@@ -49,53 +80,40 @@ jobs:
           --include "index.html" \
           --include "error.html"
 
-    - name: Debug CloudFront Distributions
-      run: |
-        aws cloudfront list-distributions | jq .
-
     - name: Create CloudFront Distribution (if not exists)
       run: |
-        DISTRIBUTION_ID=$(aws cloudfront list-distributions | jq -r --arg domain "${{ secrets.S3_BUCKET_NAME }}.s3.amazonaws.com" '.DistributionList.Items[] | select(.Origins.Items[0].DomainName == $domain) | .Id')
+        DISTRIBUTION_ID=$(aws cloudfront list-distributions | jq -r '.DistributionList.Items[] | select(.Origins.Items[0].DomainName == ("'${{ secrets.S3_BUCKET_NAME }}'.s3.amazonaws.com")) | .Id')
 
         if [ -z "$DISTRIBUTION_ID" ]; then
-          echo "No existe una distribución de CloudFront para el bucket. Creándola..."
+          echo "Creando una nueva distribución de CloudFront..."
           aws cloudfront create-distribution \
-            --origin-domain-name "${{ secrets.S3_BUCKET_NAME }}.s3.amazonaws.com" \
+            --origin-names ${{ secrets.S3_BUCKET_NAME }}.s3.amazonaws.com \
             --default-root-object index.html \
-            --output json | jq -r '.Distribution.Id'
+            --behaviors "{'Paths': ['/*'], 'CachedMethods': ['GET', 'HEAD'], 'DefaultBehavior': true, 'ForwardHeaders': ['Origin'], 'ViewerProtocolPolicy': 'RedirectToHttps'}" \
+            | jq -r '.Distribution.DomainName'
+          echo "Esperando 5 minutos para que la distribución de CloudFront se active..."
+          sleep 300
         else
-          echo "La distribución de CloudFront ya existe: $DISTRIBUTION_ID"
+          echo "CloudFront distribution already exists: $DISTRIBUTION_ID"
         fi
 
     - name: Invalidate CloudFront cache
       run: |
-        DISTRIBUTION_ID=$(aws cloudfront list-distributions | jq -r --arg domain "${{ secrets.S3_BUCKET_NAME }}.s3.amazonaws.com" '.DistributionList.Items[] | select(.Origins.Items[0].DomainName == $domain) | .Id')
+        DISTRIBUTION_ID=$(aws cloudfront list-distributions | jq -r '.DistributionList.Items[] | select(.Origins.Items[0].DomainName == ("'${{ secrets.S3_BUCKET_NAME }}'.s3.amazonaws.com")) | .Id')
 
-        if [ -n "$DISTRIBUTION_ID" ]; then
-          aws cloudfront create-invalidation \
-            --distribution-id $DISTRIBUTION_ID \
-            --paths "/*"
-          echo "Invalidación del caché de CloudFront completada."
-        else
-          echo "Error: No se pudo encontrar una distribución de CloudFront para invalidar el caché."
-          exit 1
-        fi
+        aws cloudfront create-invalidation \
+          --distribution-id $DISTRIBUTION_ID \
+          --paths "/*"
 
     - name: Verify Deployment
       run: |
-        # Verificar que los archivos estén en S3
-        aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}
+          # Verificar que los archivos estén en S3
+          aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}
 
-        # Obtener la URL de CloudFront
-        CLOUDFRONT_URL=$(aws cloudfront list-distributions | jq -r --arg domain "${{ secrets.S3_BUCKET_NAME }}.s3.amazonaws.com" '.DistributionList.Items[] | select(.Origins.Items[0].DomainName == $domain) | .DomainName')
+          # URL de CloudFront (assuming successful creation)
+          CLOUDFRONT_URL=$(aws cloudfront list-distributions | jq -r '.DistributionList.Items[] | select(.Origins.Items[0].DomainName == ("'${{ secrets.S3_BUCKET_NAME }}'.s3.amazonaws.com")) | .DomainName')
+          echo "CloudFront URL: https://$CLOUDFRONT_URL"
 
-        if [ -z "$CLOUDFRONT_URL" ]; then
-          echo "Error: No se pudo encontrar una URL de CloudFront."
-          exit 1
-        fi
-
-        echo "CloudFront URL: https://$CLOUDFRONT_URL"
-
-        # Intentar obtener los archivos
-        curl -f https://$CLOUDFRONT_URL/index.html
-        curl -f https://$CLOUDFRONT_URL/error.html
+          # Intentar obtener los archivos
+          curl -f https://$CLOUDFRONT_URL/index.html
+          curl -f https://$CLOUDFRONT_URL/error.html
